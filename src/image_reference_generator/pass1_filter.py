@@ -2,8 +2,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import os
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 from PIL import Image, UnidentifiedImageError
 
 
@@ -86,14 +89,22 @@ def process_pass1(image_path: Path) -> ImageQualityMetrics | None:
         new_h = int(h * scale_factor)
         img_for_detection = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # Mediapipe Face Detection
-    mp_face_detection = mp.solutions.face_detection
-    with mp_face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=0.5
-    ) as face_detection:
+    # Modern MediaPipe tasks Face Detection
+    model_path = Path(__file__).parent / "blaze_face_short_range.tflite"
+    if not model_path.exists():
+        # Fallback to hair if local model missing (unlikely but safe)
+        return None
+
+    base_options = python.BaseOptions(model_asset_path=str(model_path))
+    options = vision.FaceDetectorOptions(base_options=base_options)
+    
+    with vision.FaceDetector.create_from_options(options) as detector:
+        # Convert CV2 image to MediaPipe image
         img_rgb = cv2.cvtColor(img_for_detection, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        
         try:
-            results = face_detection.process(img_rgb)
+            results = detector.detect(mp_image)
         except Exception:
             return None
 
@@ -101,13 +112,15 @@ def process_pass1(image_path: Path) -> ImageQualityMetrics | None:
             return None
 
         detection = results.detections[0]
-        bbox_c = detection.location_data.relative_bounding_box
+        bbox = detection.bounding_box
 
-        # Scale coordinates back up to native image resolution
-        rel_x = max(0.0, bbox_c.xmin)
-        rel_y = max(0.0, bbox_c.ymin)
-        rel_w = min(1.0 - rel_x, bbox_c.width)
-        rel_h = min(1.0 - rel_y, bbox_c.height)
+        # MediaPipe Tasks returns integer pixels in the detection bbox relative to the input image
+        # We need to scale these back up to native resolution using scale_factor
+        
+        rel_x = bbox.origin_x / img_for_detection.shape[1]
+        rel_y = bbox.origin_y / img_for_detection.shape[0]
+        rel_w = bbox.width / img_for_detection.shape[1]
+        rel_h = bbox.height / img_for_detection.shape[0]
 
         x = int(rel_x * w)
         y = int(rel_y * h)
