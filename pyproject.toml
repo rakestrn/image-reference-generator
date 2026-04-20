@@ -1,0 +1,41 @@
+[project]
+name = "image-reference-generator"
+version = "0.1.0"
+description = "Anti-gravity image curation tool"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "opencv-python-headless>=4.11.0.86",
+    "Pillow>=11.1.0",
+    "mediapipe>=0.10.21",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "requests>=2.32.3",
+    "scikit-learn>=1.6.1",
+    "tqdm>=4.67.1",
+]
+
+[project.scripts]
+curate = "image_reference_generator.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "ruff>=0.9.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = []
+
+[tool.pytest.ini_options]
+addopts = "-v"
+testpaths = ["tests"]
