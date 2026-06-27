@@ -1,8 +1,11 @@
-import cv2
-import os
 from pathlib import Path
 
-img_path = Path("/Users/ryanrakestraw/Library/Application Support/Cryptomator/mnt/cyptomator_vault/local_vids/juju-b/20230828_112434.jpg")
+import cv2
+
+img_path = Path(
+    "/Users/ryanrakestraw/Library/Application Support/Cryptomator/mnt/"
+    "cyptomator_vault/local_vids/juju-b/20230828_112434.jpg"
+)
 img = cv2.imread(str(img_path))
 if img is None:
     print("Could not load image")
@@ -24,5 +27,5 @@ gray = cv2.cvtColor(img_for_detection, cv2.COLOR_BGR2GRAY)
 faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
 
 print(f"Found {len(faces)} faces")
-for (x, y, w_f, h_f) in faces:
+for x, y, w_f, h_f in faces:
     print(f"  Face at {x}, {y}, size {w_f}x{h_f}")

@@ -2,9 +2,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import os
 import cv2
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from PIL import Image, UnidentifiedImageError
@@ -24,6 +24,7 @@ class ImageQualityMetrics:
         exposure_score: Balanced exposure metric punishing high-key and low-key clipping.
         face_sharpness: Structural detail isolated to the facial bounding box.
         total_score: Synthesized score weighting the technical features.
+        lighting_condition: Categorical lighting condition (e.g., 'Indoor', 'Outdoor').
     """
 
     path: Path
@@ -34,7 +35,11 @@ class ImageQualityMetrics:
     sharpness: float = 0.0
     exposure_score: float = 0.0
     face_sharpness: float = 0.0
+    contrast: float = 0.0
+    colorfulness: float = 0.0
+    noise: float = 0.0
     total_score: float = 0.0
+    lighting_condition: str | None = None
 
 
 def _verify_image_integrity(path: Path) -> bool:
@@ -54,6 +59,33 @@ def _verify_image_integrity(path: Path) -> bool:
         return False
 
 
+def load_image(image_path: Path) -> np.ndarray | None:
+    """Loads an image file path robustly using OpenCV, falling back to PIL.
+
+    This ensures support for JPEG, PNG, WebP, and other formats across environments.
+
+    Args:
+        image_path: Path to the image file to load.
+
+    Returns:
+        The loaded image as a BGR numpy array, or None if loading fails or the file is invalid.
+    """
+    if image_path is None or not isinstance(image_path, Path):
+        return None
+    if not image_path.is_file():
+        return None
+
+    try:
+        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if img is None:
+            with Image.open(image_path) as pil_raw:
+                pil_raw = pil_raw.convert("RGB")
+                img = cv2.cvtColor(np.array(pil_raw), cv2.COLOR_RGB2BGR)
+        return img
+    except Exception:
+        return None
+
+
 def process_pass1(image_path: Path) -> ImageQualityMetrics | None:
     """Evaluates an image through the Initial Liquidity Filter constraints.
 
@@ -70,7 +102,7 @@ def process_pass1(image_path: Path) -> ImageQualityMetrics | None:
     if not _verify_image_integrity(image_path):
         return None
 
-    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    img = load_image(image_path)
     if img is None:
         return None
 
@@ -97,12 +129,12 @@ def process_pass1(image_path: Path) -> ImageQualityMetrics | None:
 
     base_options = python.BaseOptions(model_asset_path=str(model_path))
     options = vision.FaceDetectorOptions(base_options=base_options)
-    
+
     with vision.FaceDetector.create_from_options(options) as detector:
         # Convert CV2 image to MediaPipe image
         img_rgb = cv2.cvtColor(img_for_detection, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-        
+
         try:
             results = detector.detect(mp_image)
         except Exception:
@@ -116,7 +148,7 @@ def process_pass1(image_path: Path) -> ImageQualityMetrics | None:
 
         # MediaPipe Tasks returns integer pixels in the detection bbox relative to the input image
         # We need to scale these back up to native resolution using scale_factor
-        
+
         rel_x = bbox.origin_x / img_for_detection.shape[1]
         rel_y = bbox.origin_y / img_for_detection.shape[0]
         rel_w = bbox.width / img_for_detection.shape[1]
