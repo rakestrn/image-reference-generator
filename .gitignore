@@ -182,3 +182,5 @@ cython_debug/
 
 # User specific framework symlinks
 TOOLS.md
+# MediaPipe model artifacts (binary, large)
+*.task

@@ -2,7 +2,12 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_distances
 from tqdm import tqdm
 
-from .ollama_integration import analyze_lighting
+from .ollama_integration import (
+    analyze_lighting,
+    check_face_occlusions,
+    check_sunglasses,
+    verify_single_person,
+)
 from .pass1_filter import ImageQualityMetrics
 from .pass3_diversity import extract_features
 
@@ -10,11 +15,15 @@ from .pass3_diversity import extract_features
 def process_pass4(
     selected_metrics: list[ImageQualityMetrics],
     full_pass2_metrics: list[ImageQualityMetrics],
-    model_name: str = "gemma4:26b",
+    model_name: str = "llava:13b",
+    favor_no_glasses: bool = True,
+    drop_sunglasses: bool = False,
 ) -> list[ImageQualityMetrics]:
     """Pass 4: Holistic Set Refinement
 
     - Subject Consensus Check: Removes outliers furthest from the median feature vector.
+    - Single-Subject Verification: Removes and replaces images with companions or multiple people.
+    - Eyewear Optimization: Actively replaces sunglasses with bare-eyed/clear-faced photos.
     - Lighting Balancing: Uses Ollama Vision to analyze lighting and enforce a 70/30 split.
     - Aesthetic 'Lift': Replaces the bottom 10% (lowest pass2 total_score) with better ones.
     """
@@ -55,17 +64,20 @@ def process_pass4(
     ]
 
     def is_duplicate(candidate_path, current_portfolio, threshold=0.05) -> bool:
-        """Mathematically prevents grabbing a visually identical image from the trash pile."""
+        """Mathematically prevents grabbing a visually identical image from the fallback pool."""
         if candidate_path not in feature_map:
             return True  # fail-safe block
 
         c_feat = feature_map[candidate_path]
-        for p_m in current_portfolio:
-            if p_m.path in feature_map:
-                dist = cosine_distances(c_feat, feature_map[p_m.path])[0][0]
-                if dist < threshold:
-                    return True
-        return False
+        portfolio_feats = [
+            feature_map[p_m.path] for p_m in current_portfolio if p_m.path in feature_map
+        ]
+        if not portfolio_feats:
+            return False
+
+        stacked = np.vstack(portfolio_feats)
+        dists = cosine_distances(c_feat, stacked)
+        return bool(np.any(dists < threshold))
 
     def replace_preserving_comp(
         composition: str,
@@ -93,17 +105,99 @@ def process_pass4(
                     selected_paths.add(replacement.path)
                     break
 
-    print("\n   -> [Pass 4.2] Lighting Balancing (70/30 Split via Ollama)")
+    print("\n   -> [Pass 4.2] Single-Subject Verification & Lighting Balancing (via Ollama)")
     indoor_count = 0
     outdoor_count = 0
+    multi_subject_removals = []
 
-    for m in tqdm(refined, desc="Classifying lighting conditions"):
-        if not m.lighting_condition:
-            m.lighting_condition = analyze_lighting(m.path, model_name=model_name)
-        if m.lighting_condition == "Outdoor":
-            outdoor_count += 1
+    for m in tqdm(list(refined), desc="Verifying subjects & lighting"):
+        is_single = verify_single_person(m.path, model_name=model_name)
+        lighting = analyze_lighting(m.path, model_name=model_name)
+        has_sunglasses = check_sunglasses(m.path, model_name=model_name)
+        has_occlusion = check_face_occlusions(m.path, model_name=model_name)
+        m.lighting_condition = lighting
+        m.has_sunglasses = has_sunglasses
+        m.has_face_occlusion = has_occlusion
+        if not is_single:
+            print(
+                f"\n      ⚠️ [VLM Filter] Multiple people/companion detected in {m.path.name}. "
+                "Flagged for replacement."
+            )
+            multi_subject_removals.append(m)
         else:
-            indoor_count += 1
+            if lighting == "Outdoor":
+                outdoor_count += 1
+            else:
+                indoor_count += 1
+
+    # Replace multiple-subject images with validated single-person candidates from remaining pool
+    for multi_m in multi_subject_removals:
+        refined.remove(multi_m)
+        for i, rm in enumerate(remaining_pool):
+            if not is_duplicate(rm.path, refined):
+                is_single = verify_single_person(rm.path, model_name=model_name)
+                lighting = analyze_lighting(rm.path, model_name=model_name)
+                rm.lighting_condition = lighting
+                rm.has_sunglasses = check_sunglasses(rm.path, model_name=model_name)
+                rm.has_face_occlusion = check_face_occlusions(rm.path, model_name)
+                if is_single:
+                    replacement = remaining_pool.pop(i)
+                    print(
+                        f"      ✅ Replaced {multi_m.path.name} with verified single-person image "
+                        f"{replacement.path.name}"
+                    )
+                    refined.append(replacement)
+                    selected_paths.add(replacement.path)
+                    if lighting == "Outdoor":
+                        outdoor_count += 1
+                    else:
+                        indoor_count += 1
+                    break
+
+    # --- PASS 4.3: FACE INTEGRITY & EYEWEAR OPTIMIZATION ---
+    # Prioritizes clear, unobstructed faces over sunglasses, caps, headphones, or turned-away poses
+    problem_images = [
+        m
+        for m in list(refined)
+        if (favor_no_glasses and getattr(m, "has_sunglasses", False))
+        or getattr(m, "has_face_occlusion", False)
+    ]
+    if problem_images:
+        print("\n   -> [Pass 4.3] Face Integrity Optimization (Favoring Unobstructed Faces)")
+        for prob_m in problem_images:
+            reason = (
+                "sunglasses"
+                if getattr(prob_m, "has_sunglasses", False)
+                else "face occlusion/turned away"
+            )
+            replaced = False
+            candidates = sorted(
+                remaining_pool,
+                key=lambda cand: (cand.composition != prob_m.composition, -cand.total_score),
+            )
+            for rm in candidates:
+                if not is_duplicate(rm.path, refined):
+                    rm_single = verify_single_person(rm.path, model_name=model_name)
+                    rm_lighting = analyze_lighting(rm.path, model_name=model_name)
+                    rm_sunglasses = check_sunglasses(rm.path, model_name=model_name)
+                    rm_occlusion = check_face_occlusions(rm.path, model_name=model_name)
+                    rm.lighting_condition = rm_lighting
+                    rm.has_sunglasses = rm_sunglasses
+                    rm.has_face_occlusion = rm_occlusion
+                    if rm_single and not rm_sunglasses and not rm_occlusion:
+                        remaining_pool.remove(rm)
+                        refined.remove(prob_m)
+                        refined.append(rm)
+                        selected_paths.add(rm.path)
+                        print(
+                            f"      ✅ Replaced {reason} photo {prob_m.path.name} with "
+                            f"clean-faced {rm.composition} shot {rm.path.name}"
+                        )
+                        replaced = True
+                        break
+            if not replaced and drop_sunglasses and getattr(prob_m, "has_sunglasses", False):
+                print(f"      🗑️ Dropped {prob_m.path.name} (strictly dropping sunglasses).")
+                refined.remove(prob_m)
 
     total = len(refined)
     target_primary = int(total * 0.7)
@@ -115,21 +209,34 @@ def process_pass4(
     if primary_count > target_primary:
         excess = primary_count - target_primary
         refined.sort(key=lambda x: x.total_score)
+        # Ensure remaining pool is prioritized by best technical quality
+        remaining_pool.sort(key=lambda x: x.total_score, reverse=True)
 
         swaps_done = 0
         images_to_remove = []
+        max_candidates_per_swap = 6
+
         for m in refined:
             if m.lighting_condition == primary_state and swaps_done < excess:
                 replacement_idx = -1
+                candidates_checked = 0
+
                 for i, rm in enumerate(remaining_pool):
-                    # Fast checks first: don't waste 15 seconds on a VLM call if the candidate
-                    # is the wrong composition or a mathematical duplicate!
+                    # Fast checks first: skip if wrong composition or mathematical duplicate
                     if rm.composition != m.composition or is_duplicate(rm.path, refined):
                         continue
 
                     if not rm.lighting_condition:
-                        print(f"      [VLM] Searching fallback pool: analyzing {rm.path.name}...")
-                        rm.lighting_condition = analyze_lighting(rm.path, model_name=model_name)
+                        if candidates_checked >= max_candidates_per_swap:
+                            # Reached search budget for this swap
+                            break
+                        candidates_checked += 1
+                        print(f"      [VLM] Checking fallback candidate: {rm.path.name}...")
+                        is_single = verify_single_person(rm.path, model_name=model_name)
+                        lighting = analyze_lighting(rm.path, model_name=model_name)
+                        rm.lighting_condition = lighting
+                        if not is_single:
+                            continue
 
                     if rm.lighting_condition == secondary_state:
                         replacement_idx = i
@@ -144,8 +251,11 @@ def process_pass4(
         for m in images_to_remove:
             refined.remove(m)
 
-    print("\n   -> [Pass 4.3] Aesthetic 'Lift'")
-    lift_count = max(1, int(len(refined) * 0.10))
+    if not refined:
+        return []
+
+    print("\n   -> [Pass 4.4] Aesthetic 'Lift'")
+    lift_count = min(len(refined), max(1, int(len(refined) * 0.10)))
     refined.sort(key=lambda x: x.total_score)
 
     lift_removals = []

@@ -1,3 +1,1 @@
-import mediapipe as mp
-
-print(dir(mp.tasks.vision))
+# Scratch script placeholder

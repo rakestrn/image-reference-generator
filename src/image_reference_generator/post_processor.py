@@ -10,23 +10,24 @@ def process_and_save_images(
     metrics_list: list[ImageQualityMetrics],
     output_dir: Path,
     trigger_word: str,
-    output_format: str = "preserve",
-    preserve_aspect_ratio: bool = False,
+    output_format: str = "jpg",
+    preserve_aspect_ratio: bool = True,
     drop_watermarked: bool = False,
 ):
     """Adaptive Smart-Scaling and Execution.
 
     Loops through the highly curated portfolio, utilizing EasyOCR to detect
     and crop any textual watermarks. Scales images, maintaining aspect ratio
-    if requested, or square cropping perfectly.
-    Uses PIL to encode to pure safetensors-approved JPEG/PNG/WebP formats.
+    by default (snapping dimensions to 64px increments around ~1024^2 area)
+    for modern diffusion multi-aspect ratio bucketing (ARB).
+    Uses PIL to encode to pure safetensors-approved JPEG/PNG formats.
 
     Args:
         metrics_list: List of the final curated ImageQualityMetrics portfolio.
         output_dir: Absolute path resolving the output target directory.
         trigger_word: Unique identifying string sequentially stamped into the filename.
         output_format: Target output image format ('jpg', 'png', 'webp', or 'preserve').
-        preserve_aspect_ratio: If true, bucket resolution matching ~1024^2 area.
+        preserve_aspect_ratio: If true (default), bucket resolution matching ~1024^2 area.
         drop_watermarked: If true, drop images containing watermarks entirely.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +47,11 @@ def process_and_save_images(
                 format_name = "PNG"
                 ext = ".png"
             elif suffix == ".webp":
+                print(
+                    f" ⚠️  Warning: Preserving WebP format for '{metrics.path.name}'. "
+                    "WebP is discouraged due to loader decoding bugs in certain LoRA "
+                    "training containers. Standardizing to JPG or PNG is strongly recommended."
+                )
                 format_name = "WEBP"
                 ext = ".webp"
             else:
@@ -58,6 +64,11 @@ def process_and_save_images(
             format_name = "PNG"
             ext = ".png"
         elif output_format == "webp":
+            print(
+                " ⚠️  Warning: Exporting as WebP. "
+                "WebP is discouraged due to loader decoding bugs in certain LoRA "
+                "training containers. Standardizing to JPG or PNG is strongly recommended."
+            )
             format_name = "WEBP"
             ext = ".webp"
         else:
@@ -78,7 +89,7 @@ def process_and_save_images(
         import easyocr
 
         if not hasattr(process_and_save_images, "reader"):
-            process_and_save_images.reader = easyocr.Reader(["en"])
+            process_and_save_images.reader = easyocr.Reader(["en"], verbose=False)
 
         margin_h = int(h * 0.15)
         top_roi = img[0:margin_h, 0:w]
@@ -149,16 +160,24 @@ def process_and_save_images(
         target_area = 1024 * 1024
 
         if preserve_aspect_ratio:
-            # Scale so width * height ~ target_area
-            aspect = w / h
-            new_h = int((target_area / aspect) ** 0.5)
-            new_w = int(new_h * aspect)
+            if (w * h) > target_area:
+                # Downscale so width * height ~ target_area (1024^2)
+                aspect = w / h
+                new_h = int((target_area / aspect) ** 0.5)
+                new_w = int(new_h * aspect)
+            else:
+                # Never artificially upscale smaller images; keep native scale for 512/768 buckets
+                new_w = w
+                new_h = h
 
             # Snap to nearest multiple of 64
             new_w = max(64, round(new_w / 64) * 64)
             new_h = max(64, round(new_h / 64) * 64)
 
-            img_cropped = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            if (new_w, new_h) != (w, h):
+                img_cropped = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                img_cropped = img
         else:
             # Scale shortest dimension to exactly 1024
             if h < w:
@@ -193,16 +212,16 @@ def process_and_save_images(
                 img_cropped = img_resized[:, crop_start_x : crop_start_x + crop_size]
             elif new_h > crop_size:
                 if metrics.face_box:
-                    face_top_y = metrics.face_box[1] * scale_factor
-                    face_height = metrics.face_box[3] * scale_factor
-                    crop_start_y = int(face_top_y - (face_height * 0.5))
+                    face_center_y = (
+                        metrics.face_box[1] + metrics.face_box[3] / 2.0
+                    ) * scale_factor
+                    # Position face in upper third to preserve torso and avoid amputating hands
+                    ideal_start_y = int(face_center_y - (crop_size * 0.35))
+                    crop_start_y = max(0, min(new_h - crop_size, ideal_start_y))
                 else:
-                    crop_start_y = int(face_center_y - (crop_size / 2))
-
-                if crop_start_y < 0:
-                    crop_start_y = 0
-                elif crop_start_y + crop_size > new_h:
-                    crop_start_y = new_h - crop_size
+                    crop_start_y = max(
+                        0, min(new_h - crop_size, int(face_center_y - (crop_size / 2)))
+                    )
 
                 img_cropped = img_resized[crop_start_y : crop_start_y + crop_size, :]
             else:
